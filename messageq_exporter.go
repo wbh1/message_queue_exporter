@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"net/http"
 	"strconv"
 
@@ -15,37 +14,23 @@ import (
 	"strings"
 )
 
-var (
-	// the label names we use for each distinct queue
-	queueLabelNames = []string{"message_queue_id", "owner"}
+const (
+	namespace = "nagios"
 )
 
-// NewQueue creates a new Gauge vector with label names specified above and returns it
-func NewQueue() *prometheus.GaugeVec {
-	return prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: "nagios_message_queue",
-			Name:      "length",
-			Help:      "length of the kernel message queue",
-		},
-		queueLabelNames,
+var (
+	msgQueueDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "message_queue", "length"),
+		"length of the kernel message queue",
+		[]string{"message_queue_id", "owner"},
+		nil,
 	)
-}
+)
 
-type msqExporter struct {
-	queues map[int]*prometheus.GaugeVec
-}
-
-func newMsgExporter() (*msqExporter, error) {
-	messagequeues, err := getQueues()
-	if err != nil {
-		return nil, err
-	}
-
-	return &msqExporter{
-		// queues is a map of kernel message queues discovered by getQueues()
-		queues: messagequeues,
-	}, nil
+type msgQueue struct {
+	owner  string
+	id     string
+	length float64
 }
 
 // Exporter is a basic type that shows if the exporter is up
@@ -69,29 +54,31 @@ func NewExporter() (*Exporter, error) {
 // Describe describes all the metrics ever exported by the message queue exporter. It
 // implements prometheus.Collector.
 func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
+	ch <- msgQueueDesc
 	ch <- e.up.Desc()
-}
-
-func (msq *msqExporter) Describe(ch chan<- *prometheus.Desc) {
-	for _, m := range msq.queues {
-		m.Describe(ch)
-	}
 }
 
 // Collect fetches the stats from ipcs -q and delivers them
 // as Prometheus metrics. It implements prometheus.Collector.
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 
-	msqExporter, err := newMsgExporter()
+	msgQueues, err := getMsgQueues()
 
 	if err != nil {
 		log.Errorf("Cannot get message queue(s): %v", err)
 		e.up.Set(0)
+		ch <- e.up
+		return
 	}
 
-	if len(msqExporter.queues) != 0 {
-		prometheus.Unregister(msqExporter)
-		prometheus.MustRegister(msqExporter)
+	for i := 0; i < len(msgQueues); i++ {
+		ch <- prometheus.MustNewConstMetric(
+			msgQueueDesc,
+			prometheus.GaugeValue,
+			msgQueues[i].length,
+			msgQueues[i].id,
+			msgQueues[i].owner,
+		)
 	}
 
 	e.up.Set(1)
@@ -99,30 +86,8 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	ch <- e.up
 }
 
-func (msq *msqExporter) Collect(ch chan<- prometheus.Metric) {
-	msq.resetMetrics()
-
-	msq.scrape()
-	msq.collectMetrics(ch)
-
-}
-
-// resetMetrics does what it says
-func (msq *msqExporter) resetMetrics() {
-	for _, m := range msq.queues {
-		m.Reset()
-	}
-}
-
-// Collect metrics for each queue
-func (msq *msqExporter) collectMetrics(metrics chan<- prometheus.Metric) {
-	for _, m := range msq.queues {
-		m.Collect(metrics)
-	}
-}
-
-// Scrape actually sets the metric values
-func (msq *msqExporter) scrape() {
+// getMsgQueues finds all the message queues and returns a slice containing them
+func getMsgQueues() ([]msgQueue, error) {
 
 	cmd := exec.Command("ipcs", "-q")
 	var out bytes.Buffer
@@ -130,11 +95,13 @@ func (msq *msqExporter) scrape() {
 	err := cmd.Run()
 	if err != nil {
 		log.Errorf("Cannot get message queue(s): %v", err)
-		return
+		return nil, err
 	}
 
 	results := strings.Split(out.String(), "\n")[3:]
+	var queues []msgQueue
 
+	// iterate through the results
 	for i := 0; i < len(results); i++ {
 		a := strings.Fields(results[i])
 		if len(a) == 6 {
@@ -143,52 +110,22 @@ func (msq *msqExporter) scrape() {
 			length, err := strconv.ParseFloat(string(a[5]), 64)
 			if err != nil {
 				log.Errorf("Cannot parse queue length: %v", err)
+				length = 0
 				continue
 			}
-			// For each queue, set its value with corresponding labels.
-			msq.exportQueue(i, msgqID, owner, length)
-		}
-	}
-}
 
-func (msq *msqExporter) exportQueue(index int, msqgID string, owner string, length float64) {
-	// Only set the metric if there is a metric in the queues map for it
-	if len(msq.queues) >= index+1 {
-		msq.queues[index].WithLabelValues(msqgID, owner).Set(length)
-	} else {
-		log.Errorf("Attempt to set queue value failed. Index outside of range")
-	}
-}
-
-func getQueues() (map[int]*prometheus.GaugeVec, error) {
-
-	queues := map[int]*prometheus.GaugeVec{}
-
-	cmd := exec.Command("ipcs", "-q")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	err := cmd.Run()
-	if err != nil {
-		return nil, fmt.Errorf("cannot get message queue(s): %v", err)
-	}
-
-	results := strings.Split(out.String(), "\n")[3:]
-
-	for i := 0; i < len(results); i++ {
-		a := strings.Fields(results[i])
-		if len(a) == 6 {
-			queues[i] = NewQueue()
+			// Append each queue
+			queues = append(queues, msgQueue{owner, msgqID, length})
 		}
 	}
 
 	return queues, nil
-
 }
 
 func main() {
 
 	var (
-		listenaddress = flag.String("listen-address", ":8080", "Address on which to expose metrics.")
+		listenaddress = flag.String("listen-address", "8080", "Port on which to expose metrics.")
 		metricspath   = flag.String("telemetry-path", "/metrics", "Path under which to expose metrics.")
 	)
 
@@ -204,6 +141,6 @@ func main() {
 	// The Handler function provides a default handler to expose metrics
 	// via an HTTP server. "/metrics" is the usual endpoint for that.
 	http.Handle(*metricspath, promhttp.Handler())
-	log.Infoln("Listening on port %v... \n", *listenaddress)
-	log.Fatal(http.ListenAndServe(*listenaddress, nil))
+	log.Infoln("Listening on port", *listenaddress)
+	log.Fatal(http.ListenAndServe(":"+*listenaddress, nil))
 }
