@@ -1,3 +1,4 @@
+[![Go Report Card](https://goreportcard.com/badge/github.com/wbh1/message_queue_exporter)](https://goreportcard.com/report/github.com/wbh1/message_queue_exporter)
 # System V Message Queue Exporter for Prometheus
 ### Why?
 Tragically, Prometheus's node_exporter does not have built in support for monitoring message queues and the C wrappers aren't built-in to the sys/unix standard library package for msgctl
